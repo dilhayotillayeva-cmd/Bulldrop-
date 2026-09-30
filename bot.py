@@ -39,11 +39,21 @@ def init_db():
     db('''CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,task_type TEXT NOT NULL DEFAULT 'link',target TEXT NOT NULL,reward_coins INTEGER NOT NULL DEFAULT 1,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL)''')
     db('''CREATE TABLE IF NOT EXISTS task_completions(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER NOT NULL,user_id INTEGER NOT NULL,completed_at TEXT NOT NULL,UNIQUE(task_id,user_id))''')
     db('''CREATE TABLE IF NOT EXISTS user_languages(user_id INTEGER PRIMARY KEY,lang TEXT NOT NULL DEFAULT 'uz')''')
+    db('''CREATE TABLE IF NOT EXISTS daily_bonuses(user_id INTEGER PRIMARY KEY,last_date TEXT,streak INTEGER NOT NULL DEFAULT 0)''')
+    db('''CREATE TABLE IF NOT EXISTS wheel_spins(user_id INTEGER PRIMARY KEY,last_date TEXT)''')
+    db('''CREATE TABLE IF NOT EXISTS coin_events(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,amount INTEGER NOT NULL,source TEXT NOT NULL,created_at TEXT NOT NULL)''')
 
 def lang(uid):
     r=db('SELECT lang FROM user_languages WHERE user_id=?',(uid,),True); return r[0]['lang'] if r else None
 
 def set_lang(uid,l): db('INSERT INTO user_languages(user_id,lang) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang',(uid,l))
+
+def add_coins(uid, amount, source):
+    amount=int(amount)
+    if amount <= 0: return
+    with conn:
+        conn.execute('UPDATE users SET coins=coins+? WHERE user_id=?',(amount,uid))
+        conn.execute('INSERT INTO coin_events(user_id,amount,source,created_at) VALUES(?,?,?,?)',(uid,amount,source,now()))
 
 def T(l,uz,ru): return ru if l=='ru' else uz
 
@@ -53,7 +63,7 @@ def ensure_user(obj,inviter=None):
         inv=inviter if inviter and inviter!=u.id else None
         db('INSERT INTO users(user_id,username,first_name,invited_by,created_at) VALUES(?,?,?,?,?)',(u.id,u.username or '',u.first_name or '',inv,now()))
         if inv and db('SELECT user_id FROM users WHERE user_id=?',(inv,),True):
-            try: db('INSERT INTO referrals(inviter_id,invited_id,created_at) VALUES(?,?,?)',(inv,u.id,now())); db('UPDATE users SET coins=coins+1 WHERE user_id=?',(inv,))
+            try: db('INSERT INTO referrals(inviter_id,invited_id,created_at) VALUES(?,?,?)',(inv,u.id,now())); add_coins(inv,1,'referral')
             except sqlite3.IntegrityError: pass
     else: db('UPDATE users SET username=?,first_name=? WHERE user_id=?',(u.username or '',u.first_name or '',u.id))
 
@@ -100,7 +110,13 @@ async def require_subscription(obj):
     return False
 
 def main_menu(l):
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=T(l,'🎁 QUTILAR','🎁 КОРОБКИ')),KeyboardButton(text=T(l,'👤 PROFIL','👤 ПРОФИЛЬ'))],[KeyboardButton(text=T(l,'🏆 TOP','🏆 ТОП')),KeyboardButton(text=T(l,'👥 REFERAL','👥 РЕФЕРАЛ'))],[KeyboardButton(text=T(l,'🎯 VAZIFALAR','🎯 ЗАДАНИЯ'))],[KeyboardButton(text=T(l,"🌐 TILNI O'ZGARTIRISH",'🌐 СМЕНИТЬ ЯЗЫК'))]],resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text=T(l,'🎁 QUTILAR','🎁 КОРОБКИ')),KeyboardButton(text=T(l,'👤 PROFIL','👤 ПРОФИЛЬ'))],
+        [KeyboardButton(text=T(l,'🏆 TOP','🏆 ТОП')),KeyboardButton(text=T(l,'👥 REFERAL','👥 РЕФЕРАЛ'))],
+        [KeyboardButton(text=T(l,'🎯 VAZIFALAR','🎯 ЗАДАНИЯ'))],
+        [KeyboardButton(text=T(l,'🎁 KUNLIK BONUS','🎁 ЕЖЕДНЕВНЫЙ БОНУС')),KeyboardButton(text=T(l,'🎡 OMAD G‘ILDIRAGI','🎡 КОЛЕСО УДАЧИ'))],
+        [KeyboardButton(text=T(l,'🎟 PROMOKOD','🎟 ПРОМОКОД'))],
+        [KeyboardButton(text=T(l,"🌐 TILNI O'ZGARTIRISH",'🌐 СМЕНИТЬ ЯЗЫК'))]],resize_keyboard=True)
 
 def admin_menu(l):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=T(l,'📄 Promokodlar','📄 Промокоды'),callback_data='adm_promos'),InlineKeyboardButton(text=T(l,'📊 Statistika','📊 Статистика'),callback_data='adm_stats')],[InlineKeyboardButton(text=T(l,'📢 Habar yuborish','📢 Рассылка'),callback_data='adm_broadcast'),InlineKeyboardButton(text=T(l,'🎁 Quti promokod','🎁 Награды коробок'),callback_data='adm_rewards')],[InlineKeyboardButton(text=T(l,'📢 Majburiy kanallar','📢 Обязательные каналы'),callback_data='adm_channels')],[InlineKeyboardButton(text=T(l,'🎯 Vazifalar','🎯 Задания'),callback_data='adm_tasks')],[InlineKeyboardButton(text=T(l,'🚪 Chiqish','🚪 Выйти'),callback_data='adm_exit')]])
@@ -169,19 +185,74 @@ async def profile(m):
     else: text=f"👤 <b>PROFIL</b>\n\nNomi: <b>{u['first_name'] or 'Nomaʼlum'}</b>\n🪙 Tangalar soni: <b>{u['coins']}</b>\n🔗 Referal havolangiz:\n<code>{link}</code>\n🎁 Ochilgan qutilar: <b>{u['opened_boxes']}</b>"
     await m.answer(text,reply_markup=main_menu(l))
 
-@dp.message(F.text.in_({'🏆 TOP','🏆 ТОП'}))
-async def top(m):
-    if not await require_subscription(m): return
-    l=lang(m.from_user.id); rows=db('SELECT username,first_name,coins FROM users ORDER BY coins DESC,user_id ASC LIMIT 10',fetch=True); text=T(l,'🏆 <b>TOP — Tangalar bo‘yicha</b>\n\n','🏆 <b>ТОП — по монетам</b>\n\n')
-    for i,r in enumerate(rows,1): text+=f"{i}. {('@'+r['username']) if r['username'] else (r['first_name'] or ('Пользователь' if l=='ru' else 'Foydalanuvchi'))} — 🪙 <b>{r['coins']}</b>\n"
-    await m.answer(text,reply_markup=main_menu(l))
-
 @dp.message(F.text.in_({'👥 REFERAL','👥 РЕФЕРАЛ'}))
 async def referral(m):
     if not await require_subscription(m): return
     l=lang(m.from_user.id); me=await bot.get_me(); link=f'https://t.me/{me.username}?start=ref_{m.from_user.id}'; count=db('SELECT COUNT(*) c FROM referrals WHERE inviter_id=?',(m.from_user.id,),True)[0]['c']
     text=T(l,f'👥 <b>REFERAL</b>\n\nHar bir yangi foydalanuvchi uchun: <b>+1 🪙</b>\nTaklif qilganlaringiz: <b>{count}</b>\n\n🔗 Sizning havolangiz:\n<code>{link}</code>',f'👥 <b>РЕФЕРАЛ</b>\n\nЗа каждого нового пользователя: <b>+1 🪙</b>\nПриглашено: <b>{count}</b>\n\n🔗 Ваша ссылка:\n<code>{link}</code>')
     await m.answer(text,reply_markup=main_menu(l))
+
+
+@dp.message(F.text.in_({'🎁 KUNLIK BONUS','🎁 ЕЖЕДНЕВНЫЙ БОНУС'}))
+async def daily_bonus(m):
+    if not await require_subscription(m): return
+    l=lang(m.from_user.id); today=datetime.now(timezone.utc).date().isoformat()
+    row=db('SELECT * FROM daily_bonuses WHERE user_id=?',(m.from_user.id,),True)
+    if row and row[0]['last_date']==today:
+        await m.answer(T(l,'🎁 <b>Bugungi bonusni allaqachon oldingiz!</b>\n\nErtaga yana qayting.','🎁 <b>Вы уже получили сегодняшний бонус!</b>\n\nВозвращайтесь завтра.'),reply_markup=main_menu(l)); return
+    streak=0
+    if row and row[0]['last_date']:
+        try:
+            prev=datetime.fromisoformat(row[0]['last_date']).date()
+            if (datetime.fromisoformat(today).date()-prev).days==1: streak=int(row[0]['streak'])+1
+        except: streak=0
+    if streak==0: streak=1
+    reward=min(2+streak-1,10)
+    db('INSERT INTO daily_bonuses(user_id,last_date,streak) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET last_date=excluded.last_date,streak=excluded.streak',(m.from_user.id,today,streak))
+    add_coins(m.from_user.id,reward,'daily_bonus')
+    await m.answer(T(l,f'🎉 <b>KUNLIK BONUS OLINDI!</b>\n\n🪙 Mukofot: <b>+{reward} tanga</b>\n🔥 Streak: <b>{streak} kun</b>','🎉 <b>ЕЖЕДНЕВНЫЙ БОНУС ПОЛУЧЕН!</b>\n\n🪙 Награда: <b>+{reward} монет</b>\n🔥 Серия: <b>{streak} дн.</b>'),reply_markup=main_menu(l))
+
+@dp.message(F.text.in_({'🎡 OMAD G‘ILDIRAGI','🎡 КОЛЕСО УДАЧИ'}))
+async def wheel(m):
+    if not await require_subscription(m): return
+    l=lang(m.from_user.id); today=datetime.now(timezone.utc).date().isoformat(); row=db('SELECT last_date FROM wheel_spins WHERE user_id=?',(m.from_user.id,),True)
+    if row and row[0]['last_date']==today:
+        await m.answer(T(l,'🎡 Bugun g‘ildirakni aylantirgansiz. Ertaga yana urinib ko‘ring.','🎡 Сегодня вы уже крутили колесо. Попробуйте завтра.'),reply_markup=main_menu(l)); return
+    reward=random.choice([0,1,2,3,5,10])
+    db('INSERT INTO wheel_spins(user_id,last_date) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_date=excluded.last_date',(m.from_user.id,today))
+    if reward: add_coins(m.from_user.id,reward,'wheel')
+    text=T(l,f'🎡 <b>OMAD G‘ILDIRAGI</b>\n\n🎉 Sizga <b>+{reward} tanga</b> tushdi!','🎡 <b>КОЛЕСО УДАЧИ</b>\n\n🎉 Вам выпало <b>+{reward} монет</b>!') if reward else T(l,'🎡 <b>OMAD G‘ILDIRAGI</b>\n\n😔 Bu safar 0 tanga. Ertaga yana urinib ko‘ring!','🎡 <b>КОЛЕСО УДАЧИ</b>\n\n😔 В этот раз 0 монет. Попробуйте завтра!')
+    await m.answer(text,reply_markup=main_menu(l))
+
+@dp.message(F.text.in_({'🎟 PROMOKOD','🎟 ПРОМОКОД'}))
+async def promo_user(m):
+    if not await require_subscription(m): return
+    l=lang(m.from_user.id); user_pending[m.from_user.id]={'action':'promo_redeem'}
+    await m.answer(T(l,'🎟 <b>PROMOKODNI KIRITING</b>\n\nMasalan: <code>GOLD500</code>','🎟 <b>ВВЕДИТЕ ПРОМОКОД</b>\n\nНапример: <code>GOLD500</code>') )
+
+@dp.message(F.text.in_({'🏆 TOP','🏆 ТОП'}))
+async def top_menu(m):
+    if not await require_subscription(m): return
+    l=lang(m.from_user.id)
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=T(l,'🏆 Umumiy TOP','🏆 Общий TOP'),callback_data='top_all'),InlineKeyboardButton(text=T(l,'🔥 Haftalik TOP','🔥 Недельный TOP'),callback_data='top_week')],
+        [InlineKeyboardButton(text=T(l,'⬅️ Menyu','⬅️ Меню'),callback_data='user_menu')]])
+    await m.answer(T(l,'🏆 <b>TOP</b>\n\nQaysi reytingni ko‘rmoqchisiz?','🏆 <b>TOP</b>\n\nКакой рейтинг показать?'),reply_markup=kb)
+
+@dp.callback_query(F.data=='top_all')
+async def top_all(c):
+    if not await require_subscription(c): return
+    l=lang(c.from_user.id); rows=db('SELECT username,first_name,coins FROM users ORDER BY coins DESC,user_id ASC LIMIT 10',fetch=True); text=T(l,'🏆 <b>TOP — Tangalar bo‘yicha</b>\n\n','🏆 <b>TOP — по монетам</b>\n\n')
+    for i,r in enumerate(rows,1): text+=f"{i}. {('@'+r['username']) if r['username'] else (r['first_name'] or ('Пользователь' if l=='ru' else 'Foydalanuvchi'))} — 🪙 <b>{r['coins']}</b>\n"
+    await c.answer(); await c.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=T(l,'🔥 Haftalik TOP','🔥 Недельный TOP'),callback_data='top_week')],[InlineKeyboardButton(text=T(l,'⬅️ Menyu','⬅️ Меню'),callback_data='user_menu')]]))
+
+@dp.callback_query(F.data=='top_week')
+async def top_week(c):
+    if not await require_subscription(c): return
+    l=lang(c.from_user.id); rows=db('SELECT u.username,u.first_name,COALESCE(SUM(e.amount),0) earned FROM users u LEFT JOIN coin_events e ON e.user_id=u.user_id AND e.created_at>=datetime(\'now\',\'-7 days\') GROUP BY u.user_id ORDER BY earned DESC,u.user_id ASC LIMIT 10',fetch=True)
+    text=T(l,'🔥 <b>HAFTALIK TOP — oxirgi 7 kun</b>\n\n','🔥 <b>НЕДЕЛЬНЫЙ TOP — последние 7 дней</b>\n\n')
+    for i,r in enumerate(rows,1): text+=f"{i}. {('@'+r['username']) if r['username'] else (r['first_name'] or ('Пользователь' if l=='ru' else 'Foydalanuvchi'))} — 🪙 <b>{r['earned']}</b>\n"
+    await c.answer(); await c.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=T(l,'🏆 Umumiy TOP','🏆 Общий TOP'),callback_data='top_all')],[InlineKeyboardButton(text=T(l,'⬅️ Menyu','⬅️ Меню'),callback_data='user_menu')]]))
 
 @dp.message(F.text.in_({'🎯 VAZIFALAR','🎯 ЗАДАНИЯ'}))
 async def tasks(m):
@@ -231,7 +302,7 @@ async def task_complete(c,tid):
     t=trows[0]
     try:
         with conn:
-            conn.execute('INSERT INTO task_completions(task_id,user_id,completed_at) VALUES(?,?,?)',(tid,c.from_user.id,now())); conn.execute('UPDATE users SET coins=coins+? WHERE user_id=?',(t['reward_coins'],c.from_user.id))
+            conn.execute('INSERT INTO task_completions(task_id,user_id,completed_at) VALUES(?,?,?)',(tid,c.from_user.id,now())); conn.execute('UPDATE users SET coins=coins+? WHERE user_id=?',(t['reward_coins'],c.from_user.id)); conn.execute('INSERT INTO coin_events(user_id,amount,source,created_at) VALUES(?,?,?,?)',(c.from_user.id,t['reward_coins'],'task',now()))
     except sqlite3.IntegrityError: await c.answer(T(l,'Bu vazifadan tanga allaqachon olingan.','За это задание монеты уже получены.'),show_alert=True); return
     await c.answer(f"🎉 +{t['reward_coins']} {T(l,'tanga!','монет!')}",show_alert=True); await c.message.answer(f"🎉 <b>{T(l,'VAZIFA BAJARILDI!','ЗАДАНИЕ ВЫПОЛНЕНО!')}</b>\n\n{t['title']}\n🪙 {T(l,'Mukofot','Награда')}: <b>+{t['reward_coins']} {T(l,'tanga','монет')}</b>",reply_markup=main_menu(l))
 
@@ -263,7 +334,7 @@ async def box(c):
     with conn: conn.execute("UPDATE rounds SET status='resolved',resolved_at=? WHERE id=? AND status='open'",(now(),rid)); conn.execute('UPDATE users SET opened_boxes=opened_boxes+1 WHERE user_id=?',(c.from_user.id,))
     if b==r['winning_box']:
         if reward[0]['reward_type']=='coins':
-            amount=reward[0]['coins']; db('UPDATE users SET coins=coins+? WHERE user_id=?',(amount,c.from_user.id)); text=T(l,f'🎉 <b>TABRIKLAYMIZ!</b>\n\nSiz yutuqli qutini tanladingiz!\n\n🪙 Mukofot: <b>+{amount} tanga</b>',f'🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\nВы выбрали выигрышную коробку!\n\n🪙 Награда: <b>+{amount} монет</b>')
+            amount=reward[0]['coins']; add_coins(c.from_user.id,amount,'box_reward'); text=T(l,f'🎉 <b>TABRIKLAYMIZ!</b>\n\nSiz yutuqli qutini tanladingiz!\n\n🪙 Mukofot: <b>+{amount} tanga</b>',f'🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\nВы выбрали выигрышную коробку!\n\n🪙 Награда: <b>+{amount} монет</b>')
         else:
             code=reward[0]['promo_code'] or reward[0]['name']; text=T(l,f'🎉 <b>TABRIKLAYMIZ!</b>\n\n🎟️ Sizning promokodingiz:\n<code>{code}</code>',f'🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\n🎟️ Ваш промокод:\n<code>{code}</code>')
         await c.answer(T(l,'🎉 YUTUQ!','🎉 ВЫИГРЫШ!'),show_alert=True)
@@ -273,6 +344,7 @@ async def box(c):
 
 # ---------- ADMIN ----------
 pending={}
+user_pending={}
 def is_admin(c): return c.from_user.id in ADMIN_IDS
 
 @dp.message(Command('admin'))
@@ -411,10 +483,29 @@ async def cancel(m):
 
 @dp.message()
 async def pending_handler(m):
+    if not await require_language(m): return
     if m.from_user.id not in ADMIN_IDS:
         if not await require_subscription(m): return
+        action=user_pending.get(m.from_user.id)
+        if not action:return
+        typ=action['action']; l=lang(m.from_user.id) or 'uz'
+        if typ=='promo_redeem':
+            code=m.text.strip().upper()
+            rows=db('SELECT * FROM promo_codes WHERE code=? AND active=1',(code,),True)
+            if not rows:
+                await m.answer(T(l,'❌ Promokod topilmadi yoki faol emas.','❌ Промокод не найден или неактивен.')); user_pending.pop(m.from_user.id,None); return
+            p=rows[0]
+            if p['uses']>=p['max_uses']:
+                await m.answer(T(l,'❌ Bu promokod ishlatib bo‘lingan.','❌ Лимит этого промокода исчерпан.')); user_pending.pop(m.from_user.id,None); return
+            if db('SELECT id FROM promo_uses WHERE promo_id=? AND user_id=?',(p['id'],m.from_user.id),True):
+                await m.answer(T(l,'❌ Siz bu promokodni avval ishlatgansiz.','❌ Вы уже использовали этот промокод.')); user_pending.pop(m.from_user.id,None); return
+            with conn:
+                conn.execute('INSERT INTO promo_uses(promo_id,user_id,used_at) VALUES(?,?,?)',(p['id'],m.from_user.id,now()))
+                conn.execute('UPDATE promo_codes SET uses=uses+1 WHERE id=?',(p['id'],))
+            add_coins(m.from_user.id,p['reward_coins'],'promo')
+            await m.answer(T(l, f"🎉 Promokod qabul qilindi!\n\n🪙 Mukofot: <b>+{p['reward_coins']} tanga</b>", f"🎉 Промокод принят!\n\n🪙 Награда: <b>+{p['reward_coins']} монет</b>"), reply_markup=main_menu(l))
+            user_pending.pop(m.from_user.id,None); return
         return
-    if not await require_language(m): return
     action=pending.get(m.from_user.id)
     if not action:return
     typ=action['action']; l=lang(m.from_user.id) or 'uz'
